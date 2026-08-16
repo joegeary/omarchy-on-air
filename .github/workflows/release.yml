@@ -1,0 +1,95 @@
+name: Release
+
+# Cuts a tagged release whenever manifest.json's version changes on main.
+# Nothing else triggers it: plugin installs track the default branch (omarchy
+# plugin update is a fast-forward pull), so tags are provenance, not delivery.
+on:
+  push:
+    branches: [main]
+    paths: ["manifest.json"]
+  workflow_dispatch:
+
+# The repository default for GITHUB_TOKEN is read-only; creating a tag and a
+# release needs this one elevation.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need the tags to know whether this version shipped
+
+      - name: Read the version, and refuse to ship a drifting one
+        id: version
+        run: |
+          set -euo pipefail
+          manifest="$(jq -r '.version // empty' manifest.json)"
+          cli="$(sed -n 's/^readonly VERSION="\(.*\)"$/\1/p' bin/on-air)"
+          if [ -z "$manifest" ]; then
+            echo "::error file=manifest.json::no version field"
+            exit 1
+          fi
+          # The two have drifted before. A release is exactly the moment that
+          # stops being cosmetic, so it is a hard failure rather than a warning.
+          if [ "$manifest" != "$cli" ]; then
+            echo "::error::version drift — manifest.json is $manifest but bin/on-air VERSION is ${cli:-unset}"
+            exit 1
+          fi
+          echo "version=$manifest" >> "$GITHUB_OUTPUT"
+
+      - name: Has this version already shipped?
+        id: tag
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify "refs/tags/v${{ steps.version.outputs.version }}" >/dev/null; then
+            echo "::notice::v${{ steps.version.outputs.version }} is already tagged; nothing to do"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Tests
+        if: steps.tag.outputs.exists == 'false'
+        run: |
+          set -euo pipefail
+          node StateMachine.test.js
+          bash tests/run.sh
+
+      - name: Manifest sanity (the checks omarchy plugin validate enforces)
+        if: steps.tag.outputs.exists == 'false'
+        run: |
+          set -euo pipefail
+          jq -e '.schemaVersion == 1' manifest.json > /dev/null
+          jq -e '.id | test("^[A-Za-z0-9][A-Za-z0-9._-]*$") and (startswith("omarchy.") | not)' manifest.json > /dev/null
+          jq -e 'has("name") and has("version") and has("kinds") and has("entryPoints")' manifest.json > /dev/null
+          # Every declared kind needs its entry point, and the file must exist.
+          for kind in $(jq -r '.kinds[]' manifest.json); do
+            case "$kind" in
+              bar-widget) key=barWidget ;;
+              *) key="$kind" ;;
+            esac
+            path="$(jq -r --arg k "$key" '.entryPoints[$k] // empty' manifest.json)"
+            if [ -z "$path" ] || [ ! -f "$path" ]; then
+              echo "::error file=manifest.json::kind '$kind' has no usable entryPoints.$key"
+              exit 1
+            fi
+          done
+          # A symlink anywhere in the tree fails installation outright.
+          if [ -n "$(find . -path ./.git -prune -o -type l -print)" ]; then
+            echo "::error::symlinks are not allowed inside a plugin folder"
+            exit 1
+          fi
+
+      - name: Cut the release
+        if: steps.tag.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "v${{ steps.version.outputs.version }}" \
+            --title "v${{ steps.version.outputs.version }}" \
+            --target "${{ github.sha }}" \
+            --generate-notes
