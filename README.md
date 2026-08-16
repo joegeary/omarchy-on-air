@@ -1,4 +1,8 @@
-# On Air
+# Omarchy On-Air Plugin
+
+<p align="center">
+<img src="preview.png" alt="Omarchy On-Air" width="300">
+</p>
 
 An [Omarchy](https://omarchy.org) (Quattro) plugin. When you join a meeting, your smart
 lights turn red and an **ON AIR** indicator appears in the bar. When the meeting ends,
