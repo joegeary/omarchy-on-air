@@ -120,7 +120,6 @@ Left-click the bar icon to open the popup:
   how long after it ends before the light goes back).
 - **Ignore list** - one-click "ignore" for anything currently detected that shouldn't
   trigger On Air (e.g. a dictation tool), and "unignore" for anything on the list.
-- **Footer** - "Run setup wizard" and "Test flash".
 
 Right-click the bar icon for a quick pause/resume without opening the popup.
 
