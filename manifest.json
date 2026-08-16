@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "joegeary.on-air",
+  "name": "On Air",
+  "version": "1.0.0",
+  "author": "Joe Geary",
+  "license": "MIT",
+  "description": "Turns your smart lights red and shows a bar indicator when you are in a meeting.",
+  "kinds": ["service", "bar-widget"],
+  "entryPoints": { "service": "Service.qml", "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "On Air",
+    "description": "Shows an ON AIR indicator and lets you pause or open settings for the on-air light automation.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": { "showWhenIdle": true },
+    "schema": [
+      { "key": "showWhenIdle", "type": "boolean", "label": "Show icon when off-air", "defaultValue": true }
+    ]
+  }
+}

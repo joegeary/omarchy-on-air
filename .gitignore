@@ -1,0 +1,13 @@
+# Common cruft only — nothing sensitive is ever generated inside this repo.
+# (Secrets/config/state live under ~/.config/on-air and ~/.local/state/on-air,
+# both outside the repo tree, regardless of working directory.)
+
+# Planning/research notes — local only, never published or shipped to users.
+.spec/
+.specs/
+
+*.log
+node_modules/
+.DS_Store
+*.swp
+*~

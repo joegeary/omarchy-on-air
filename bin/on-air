@@ -1,0 +1,1367 @@
+#!/usr/bin/env bash
+#
+# on-air — light control CLI for the Omarchy "On Air" plugin
+#          (joegeary.on-air).
+#
+# The QML layer never talks to lights; it execs this script and reads one JSON
+# line from stdout. All light I/O happens in drivers/<name>.sh.
+#
+# Every mutating command prints exactly one JSON line on stdout:
+#   {"state":"on_air","ok":["hue:<id>"],"failed":[{"target":"hue:<id>","error":"timeout"}]}
+# Exit codes: 0 all converged · 2 partial · 3 total failure · 1 config/usage error.
+
+set -euo pipefail
+
+readonly VERSION="1.0.0"
+
+# Drivers that ship with the plugin. A config value is never used as a path:
+# the driver name must match ^[a-z][a-z0-9_]*$ AND appear in this allowlist.
+readonly DRIVER_ALLOWLIST=(hue home_assistant mock)
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+readonly SELF
+REPO_ROOT="$(dirname "$(dirname "$SELF")")"
+readonly REPO_ROOT
+DRIVER_DIR="${ON_AIR_DRIVERS:-$REPO_ROOT/drivers}"
+readonly DRIVER_DIR
+
+CONFIG_FILE="${ON_AIR_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/on-air/config.json}"
+readonly CONFIG_FILE
+STATE_DIR="${ON_AIR_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/on-air}"
+readonly STATE_DIR
+readonly SNAPSHOT_FILE="$STATE_DIR/snapshot.json"
+readonly PAUSE_FILE="$STATE_DIR/pause.json"
+readonly LOCK_FILE="$STATE_DIR/lock"
+readonly LOG_FILE="$STATE_DIR/log"
+
+readonly LOG_MAX_BYTES="${ON_AIR_LOG_MAX_BYTES:-65536}"
+readonly LOG_KEEP_LINES=200
+readonly LOCK_WAIT_SECONDS="${ON_AIR_LOCK_WAIT:-15}"
+
+# Manual-change tolerances (SPEC: on/off, brightness ±3%, xy ±0.02).
+readonly TOL_BRIGHTNESS=3
+readonly TOL_XY=0.02
+
+readonly DEFAULT_CONFIG='{
+  "version": 1,
+  "onAir": { "color": "#ff0000", "brightnessPercent": 100 },
+  "riseSeconds": 8,
+  "clearSeconds": 8,
+  "ignoreApps": ["obs", "obs-studio", "cheese", "guvcview", "voxtype", "pw-cat", "parecord", "arecord"],
+  "appNames": { "zoom": "Zoom", "teams-for-linux": "Teams", "slack": "Slack", "discord": "Discord" },
+  "targets": []
+}'
+
+CFG=""          # merged config JSON, populated by load_config
+MUTATING=0      # when 1, errors are also reported as a JSON result line
+LOCK_FD=
+
+# ---------------------------------------------------------------- utilities
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+now_epoch() { date +%s; }
+
+log() {
+  local level="$1" msg="$2"
+  [[ -d "$STATE_DIR" ]] || return 0
+  # The log records app names and target ids, so it is created 0600 up front:
+  # a bare >> would leave it at the umask default until the first rotation
+  # happened to replace it with a mode-600 temp file.
+  [[ -e "$LOG_FILE" ]] || ( umask 077; : >>"$LOG_FILE" ) 2>/dev/null || true
+  printf '%s %s %s\n' "$(date -Is)" "$level" "$msg" >>"$LOG_FILE" 2>/dev/null || return 0
+  local size
+  size=$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)
+  if (( size > LOG_MAX_BYTES )); then
+    local tmp
+    tmp="$(mktemp "$STATE_DIR/.log.XXXXXX")"
+    tail -n "$LOG_KEEP_LINES" "$LOG_FILE" >"$tmp" 2>/dev/null || true
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$LOG_FILE"
+  fi
+}
+
+# Print one JSON result line and exit with the contract's code.
+emit_result() {
+  local state="$1" ok_json="$2" failed_json="$3" skipped_json="${4:-[]}"
+  local line code ok_n failed_n
+  line=$(jq -c -n \
+    --arg state "$state" \
+    --argjson ok "$ok_json" \
+    --argjson failed "$failed_json" \
+    --argjson skipped "$skipped_json" \
+    '{state:$state, ok:$ok, failed:$failed, skipped:$skipped}')
+  ok_n=$(jq -r 'length' <<<"$ok_json")
+  failed_n=$(jq -r 'length' <<<"$failed_json")
+  printf '%s\n' "$line"
+  if (( failed_n == 0 )); then
+    code=0
+  elif (( ok_n == 0 )); then
+    code=3
+  else
+    code=2
+  fi
+  log info "result $line"
+  exit "$code"
+}
+
+# Usage / config error: exit 1, and still honour the one-JSON-line contract
+# when the failing command is a mutating one.
+die() {
+  local msg="$1"
+  printf 'on-air: %s\n' "$msg" >&2
+  log error "$msg"
+  if (( MUTATING )); then
+    jq -c -n --arg e "$msg" '{state:"error", ok:[], failed:[], skipped:[], error:$e}'
+  fi
+  exit 1
+}
+
+atomic_write() { # path content
+  local path="$1" content="$2" dir tmp
+  dir="$(dirname "$path")"
+  mkdir -p "$dir"
+  tmp="$(mktemp "$dir/.tmp.XXXXXX")"
+  printf '%s\n' "$content" >"$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$path"
+}
+
+ensure_state_dir() {
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR" 2>/dev/null || true
+}
+
+# Re-assert the permissions on every run, not just from the commands that
+# write: a tree restored from a backup (or created before this hardening
+# existed) would otherwise keep its world-readable secrets until the next
+# mutating command happened along.
+secure_paths() {
+  local dir
+  dir="$(dirname "$CONFIG_FILE")"
+  # Directories are only tightened when they are ours to tighten: an
+  # ON_AIR_CONFIG pointing straight at $HOME must not silently chmod it.
+  [[ ! -d "$dir" || "$dir" == "${HOME:-}" ]] || chmod 700 "$dir" 2>/dev/null || true
+  [[ ! -f "$CONFIG_FILE" ]] || chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+  [[ ! -d "$STATE_DIR" || "$STATE_DIR" == "${HOME:-}" ]] || chmod 700 "$STATE_DIR" 2>/dev/null || true
+}
+
+preflight() {
+  local tool
+  for tool in curl jq; do
+    have "$tool" || {
+      printf 'on-air: required tool not found: %s\n' "$tool" >&2
+      exit 1
+    }
+  done
+}
+
+# Every mutating command holds this lock; all state is read *after* acquiring
+# it, so a queued clear that lost the race to trigger still converges.
+#
+# Idempotent: flock keys on the open file description, so a second open of the
+# same file from this very process would block against our own lock. Commands
+# that wrap a helper which locks too (ignore → config_set) rely on that.
+take_lock() {
+  [[ -z "$LOCK_FD" ]] || return 0
+  ensure_state_dir
+  : >>"$LOCK_FILE"
+  chmod 600 "$LOCK_FILE" 2>/dev/null || true
+  exec {LOCK_FD}<>"$LOCK_FILE"
+  flock -w "$LOCK_WAIT_SECONDS" "$LOCK_FD" || die "could not acquire lock ($LOCK_FILE)"
+}
+
+# Only `setup` needs this: it hands over to `on-air test`, a separate process
+# that takes the very same lock.
+release_lock() {
+  [[ -n "$LOCK_FD" ]] || return 0
+  exec {LOCK_FD}>&-
+  LOCK_FD=
+}
+
+# ------------------------------------------------------------------- config
+
+load_config() {
+  secure_paths
+  local file_json=""
+  if [[ -f "$CONFIG_FILE" ]]; then
+    file_json="$(cat "$CONFIG_FILE")"
+    jq -e . >/dev/null 2>&1 <<<"$file_json" || die "config is not valid JSON: $CONFIG_FILE"
+    local ver
+    ver="$(jq -r '.version // "missing"' <<<"$file_json")"
+    [[ "$ver" == "1" ]] || die "unsupported config version: $ver (expected 1)"
+  else
+    file_json='{}'
+  fi
+  # Deep merge: file wins, arrays replace wholesale.
+  CFG="$(jq -c -n --argjson d "$DEFAULT_CONFIG" --argjson f "$file_json" '$d * $f')"
+}
+
+save_config() { # config-json
+  local dir
+  dir="$(dirname "$CONFIG_FILE")"
+  mkdir -p "$dir"
+  chmod 700 "$dir" 2>/dev/null || true
+  atomic_write "$CONFIG_FILE" "$(jq -S . <<<"$1")"
+}
+
+cfg() { jq -r "$1" <<<"$CFG"; }
+cfgj() { jq -c "$1" <<<"$CFG"; }
+
+# Shared jq prelude: mask every credential a target object can carry down to
+# its last 4 characters. Used for both halves of `status`, because a snapshot
+# entry keeps its own copy of the target it was captured from.
+readonly JQ_SCRUB='
+  def tail4: if type == "string" and length > 4 then "…" + .[-4:] else "…" end;
+  def scrub_target:
+    if type == "object" then
+      (if has("appKey") then .appKey |= tail4 else . end)
+      | (if has("token") then .token |= tail4 else . end)
+      | (if has("clientKey") then .clientKey |= tail4 else . end)
+    else . end;
+'
+
+redact_config() {
+  jq "$JQ_SCRUB"'.targets = ((.targets // []) | map(scrub_target))' <<<"$CFG"
+}
+
+redact_snapshot() { # snapshot-json (may be "null")
+  jq -c "$JQ_SCRUB"'
+    if type == "object" and (.entries | type) == "array"
+    then .entries |= map(if type == "object" then .target |= scrub_target else . end)
+    else . end' <<<"$1"
+}
+
+# ------------------------------------------------------------------ drivers
+
+# Non-fatal form, for code paths where an unusable driver has to become a
+# per-entry failure instead of aborting the whole command.
+driver_available() { # name
+  local name="$1" allowed
+  [[ "$name" =~ ^[a-z][a-z0-9_]*$ ]] || return 1
+  for allowed in "${DRIVER_ALLOWLIST[@]}"; do
+    [[ "$name" == "$allowed" ]] || continue
+    [[ -x "$DRIVER_DIR/$name.sh" ]] || return 1
+    return 0
+  done
+  return 1
+}
+
+validate_driver() { # name
+  local name="$1" allowed
+  [[ "$name" =~ ^[a-z][a-z0-9_]*$ ]] || die "invalid driver name: $name"
+  for allowed in "${DRIVER_ALLOWLIST[@]}"; do
+    if [[ "$name" == "$allowed" ]]; then
+      [[ -x "$DRIVER_DIR/$name.sh" ]] || die "driver not installed: $name"
+      return 0
+    fi
+  done
+  die "unknown driver: $name"
+}
+
+DRIVER_OUT=""
+DRIVER_ERR=""
+# driver_call <driver> <verb> <payload-json> [argv...] -> 0 on success.
+# Secrets travel in the payload on stdin, never in argv.
+driver_call() {
+  local drv="$1" verb="$2" payload="$3"
+  shift 3
+  local errf rc=0
+  errf="$(mktemp "${TMPDIR:-/tmp}/on-air-err.XXXXXX")"
+  DRIVER_OUT=""
+  DRIVER_ERR=""
+  set +e
+  DRIVER_OUT="$(printf '%s' "$payload" | "$DRIVER_DIR/$drv.sh" "$verb" "$@" 2>"$errf")"
+  rc=$?
+  set -e
+  if (( rc != 0 )); then
+    # The LAST non-empty stderr line, not the first: a driver may warn before
+    # it fails (an unpinned Hue connection does), and the failure reason is
+    # always the final thing it writes.
+    DRIVER_ERR="$( { grep -v '^[[:space:]]*$' "$errf" || true; } | tail -n 1 | tr -d '\r' | cut -c1-160)"
+    [[ -n "$DRIVER_ERR" ]] || DRIVER_ERR="driver exit $rc"
+  elif ! jq -e . >/dev/null 2>&1 <<<"$DRIVER_OUT"; then
+    rc=1
+    DRIVER_ERR="driver returned invalid JSON"
+  fi
+  rm -f "$errf"
+  return "$rc"
+}
+
+# A driver may report that it re-discovered its hub at a new address; persist it
+# so the next run connects directly (SPEC: match by bridgeId, rewrite the IP).
+persist_rediscovery() { # target-index driver-output
+  local idx="$1" out="$2" ip file_json
+  ip="$(jq -r '.rediscoveredIp // empty' <<<"$out")"
+  [[ -n "$ip" ]] || return 0
+  CFG="$(jq -c --argjson i "$idx" --arg ip "$ip" '.targets[$i].bridge = $ip' <<<"$CFG")"
+  # Patch the file on disk rather than writing the merged config back, so
+  # defaults the user never set stay implicit.
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  file_json="$(cat "$CONFIG_FILE")"
+  save_config "$(jq -c --argjson i "$idx" --arg ip "$ip" '.targets[$i].bridge = $ip' <<<"$file_json")"
+  log info "target $idx bridge address updated to $ip"
+}
+
+# --------------------------------------------------------- target expansion
+
+# Expand config.targets into one line per light:
+#   <driver>\t<targetIndex>\t<targetId>\t<lightId>
+target_entries() {
+  cfgj '
+    (.targets // []) | to_entries | map(
+      .key as $i | .value as $t |
+      ($t.driver) as $d |
+      (($t.bridgeId // $t.baseUrl // $t.name // ($i|tostring))) as $tid |
+      (($t.lights // []) | map({driver: $d, index: $i, targetId: ($d + ":" + $tid), lightId: .}))
+    ) | add // []' |
+    jq -r '.[] | [.driver, .index, .targetId, .lightId] | @tsv'
+}
+
+target_config() { # index — the live target object from config
+  cfgj ".targets[$1]"
+}
+
+# The connection details a restore must use. The snapshot entry's own copy of
+# the target is the authority (SPEC: the snapshot, not the config, drives a
+# restore); the live config is consulted only to pick up a re-discovered
+# address or a rotated credential, and only for the target with the SAME
+# identity — never by array index, which a reordered or re-pointed `targets`
+# array would silently redirect to another hub.
+restore_target() { # entry-json
+  local stored live
+  stored="$(jq -c '.target // {}' <<<"$1")"
+  live="$(jq -c --argjson s "$stored" '
+    def identity: (.bridgeId // .baseUrl // .name // "");
+    ((.targets // []) | map(select((.driver // "") == ($s.driver // "")
+                                   and (identity == ($s | identity)))) | first) // null' <<<"$CFG")"
+  if [[ "$live" == "null" ]]; then
+    printf '%s' "$stored"
+  else
+    jq -c -n --argjson s "$stored" --argjson l "$live" '$s * $l'
+  fi
+}
+
+entry_label() { # driver lightId -> the string used in ok/failed arrays
+  printf '%s:%s' "$1" "$2"
+}
+
+# ----------------------------------------------------------------- snapshot
+
+snapshot_exists() { [[ -f "$SNAPSHOT_FILE" ]]; }
+
+read_snapshot() {
+  if snapshot_exists; then cat "$SNAPSHOT_FILE"; else printf '%s' 'null'; fi
+}
+
+write_snapshot() { # snapshot-json
+  atomic_write "$SNAPSHOT_FILE" "$(jq -c . <<<"$1")"
+}
+
+new_snapshot() {
+  local ts
+  ts="$(now_epoch)"
+  jq -c -n --argjson t "$ts" \
+    '{version:1, createdAt:$t, startedAt:$t, entries:[]}'
+}
+
+# Does `actual` still look like what we set? (on/off, brightness ±3%, xy ±0.02)
+state_matches() { # expected-json actual-json
+  jq -e -n --argjson e "$1" --argjson a "$2" \
+    --argjson tb "$TOL_BRIGHTNESS" --argjson tx "$TOL_XY" '
+    def absd($x; $y): (($x - $y) | if . < 0 then -. else . end);
+    (if ($e.on != null and $a.on != null) then $e.on == $a.on else true end)
+    and
+    (if ($e.on != false and $e.brightnessPercent != null and $a.brightnessPercent != null)
+     then absd($e.brightnessPercent; $a.brightnessPercent) <= $tb else true end)
+    and
+    (if ($e.on != false and ($e.xy | type) == "array" and ($a.xy | type) == "array")
+     then absd($e.xy[0]; $a.xy[0]) <= $tx and absd($e.xy[1]; $a.xy[1]) <= $tx
+     else true end)
+  ' >/dev/null 2>&1
+}
+
+# ------------------------------------------------------------------ trigger
+
+cmd_trigger() {
+  MUTATING=1
+  load_config
+  take_lock
+
+  if [[ -f "$PAUSE_FILE" ]]; then
+    log info "trigger ignored: paused"
+    emit_result paused '[]' '[]'
+  fi
+
+  local color brightness
+  color="$(cfg '.onAir.color')"
+  brightness="$(cfg '.onAir.brightnessPercent')"
+
+  local snap
+  snap="$(read_snapshot)"
+  [[ "$snap" != "null" ]] || snap="$(new_snapshot)"
+
+  local ok='[]' failed='[]' seen=0
+  local driver idx targetId lightId
+  while IFS=$'\t' read -r driver idx targetId lightId; do
+    [[ -n "$driver" ]] || continue
+    seen=$((seen + 1))
+    validate_driver "$driver"
+    local label pos target payload
+    label="$(entry_label "$driver" "$lightId")"
+    pos="$(jq -r --arg t "$targetId" --arg l "$lightId" \
+      '[.entries[] | .targetId == $t and .lightId == $l] | index(true) // -1' <<<"$snap")"
+
+    # A copy of the target is stored on the snapshot entry as well, so that a
+    # target deleted from the config mid-meeting can still be restored.
+    target="$(target_config "$idx")"
+
+    if [[ "$pos" != "-1" ]]; then
+      local applied
+      applied="$(jq -r --argjson p "$pos" '.entries[$p].applied' <<<"$snap")"
+      if [[ "$applied" == "true" ]]; then
+        ok="$(jq -c --arg l "$label" '. + [$l]' <<<"$ok")"   # already on-air: idempotent
+        continue
+      fi
+    else
+      # Not snapshotted yet: capture prior state before touching the light.
+      payload="$(jq -c -n --argjson t "$target" '{target:$t}')"
+      if ! driver_call "$driver" get "$payload" "$lightId"; then
+        failed="$(jq -c --arg l "$label" --arg e "$DRIVER_ERR" '. + [{target:$l, error:$e}]' <<<"$failed")"
+        log warn "snapshot skipped for $label: $DRIVER_ERR"
+        continue   # unreachable at snapshot time: skip entirely, never guess
+      fi
+      persist_rediscovery "$idx" "$DRIVER_OUT"
+      local prior
+      prior="$(jq -c '.state' <<<"$DRIVER_OUT")"
+      snap="$(jq -c --arg d "$driver" --argjson i "$idx" --arg t "$targetId" --arg l "$lightId" \
+        --argjson prior "$prior" --argjson target "$target" '
+        .entries += [{driver:$d, targetIndex:$i, targetId:$t, lightId:$l,
+                      applied:false, prior:$prior, expected:null, target:$target, error:null}]' <<<"$snap")"
+      pos="$(jq -r '(.entries | length) - 1' <<<"$snap")"
+      write_snapshot "$snap"
+    fi
+
+    payload="$(jq -c -n --argjson t "$target" --arg hex "$color" --argjson b "$brightness" \
+      '{target:$t, color:{hex:$hex, brightnessPercent:$b}}')"
+    if driver_call "$driver" set "$payload" "$lightId"; then
+      persist_rediscovery "$idx" "$DRIVER_OUT"
+      local expected
+      expected="$(jq -c '.expected // {}' <<<"$DRIVER_OUT")"
+      snap="$(jq -c --argjson p "$pos" --argjson exp "$expected" \
+        '.entries[$p].applied = true | .entries[$p].expected = $exp | .entries[$p].error = null' <<<"$snap")"
+      ok="$(jq -c --arg l "$label" '. + [$l]' <<<"$ok")"
+    else
+      snap="$(jq -c --argjson p "$pos" --arg e "$DRIVER_ERR" '.entries[$p].error = $e' <<<"$snap")"
+      failed="$(jq -c --arg l "$label" --arg e "$DRIVER_ERR" '. + [{target:$l, error:$e}]' <<<"$failed")"
+      log warn "set failed for $label: $DRIVER_ERR"
+    fi
+    write_snapshot "$snap"
+  done < <(target_entries)
+
+  (( seen > 0 )) || die "no targets configured — run: on-air setup"
+
+  if [[ "$(jq -r '.entries | length' <<<"$snap")" == "0" ]]; then
+    rm -f "$SNAPSHOT_FILE"
+  else
+    write_snapshot "$snap"
+  fi
+
+  local state="on_air"
+  [[ "$(jq -r 'length' <<<"$ok")" != "0" ]] || state="off_air"
+  emit_result "$state" "$ok" "$failed"
+}
+
+# -------------------------------------------------------------------- clear
+
+# Restore from the snapshot. keep=1 leaves the snapshot in place with every
+# restored entry marked applied=false, so a later trigger re-applies without
+# re-snapshotting (used by pause and by the pre-suspend hook).
+#
+# Results are returned in the CLEAR_* globals rather than on stdout: reading
+# them through a process substitution would swallow any `die` raised inside the
+# loop, leaving the caller with no result line at all.
+CLEAR_STATE="off_air"
+CLEAR_OK='[]'
+CLEAR_FAILED='[]'
+CLEAR_SKIPPED='[]'
+clear_impl() { # keep(0|1)
+  local keep="$1"
+  CLEAR_STATE="off_air"
+  CLEAR_OK='[]'
+  CLEAR_FAILED='[]'
+  CLEAR_SKIPPED='[]'
+
+  local snap
+  snap="$(read_snapshot)"
+  [[ "$snap" != "null" ]] || return 0
+
+  local ok='[]' failed='[]' skipped='[]' kept='[]'
+  local n i
+  n="$(jq -r '.entries | length' <<<"$snap")"
+  for (( i = 0; i < n; i++ )); do
+    local entry driver lightId idx label applied attempted
+    entry="$(jq -c ".entries[$i]" <<<"$snap")"
+    driver="$(jq -r '.driver' <<<"$entry")"
+    lightId="$(jq -r '.lightId' <<<"$entry")"
+    idx="$(jq -r '.targetIndex // 0' <<<"$entry")"
+    applied="$(jq -r '.applied' <<<"$entry")"
+    # A `set` that failed after reaching the hub (the reply timed out) leaves
+    # applied=false with an error recorded — the light may well be red, so the
+    # entry is verified and restored like any other, never dropped.
+    attempted="$(jq -r 'if .error == null then "false" else "true" end' <<<"$entry")"
+    label="$(entry_label "$driver" "$lightId")"
+
+    # A driver that is momentarily missing (a plugin upgrade mid-meeting) is a
+    # per-entry failure, not a reason to abandon the whole snapshot.
+    if ! driver_available "$driver"; then
+      failed="$(jq -c --arg l "$label" --arg e "driver unavailable: $driver" \
+        '. + [{target:$l, error:$e}]' <<<"$failed")"
+      kept="$(jq -c --argjson e "$entry" --arg err "driver unavailable: $driver" \
+        '. + [($e | .error = $err)]' <<<"$kept")"
+      log warn "restore deferred for $label: driver unavailable"
+      continue
+    fi
+
+    if [[ "$applied" != "true" && "$attempted" != "true" ]]; then
+      # Never reddened, or already restored: nothing to undo. Under
+      # --keep-snapshot the entry still has to survive, so a second pre-suspend
+      # clear cannot throw away the priors it is meant to be preserving.
+      [[ "$keep" != "1" ]] || kept="$(jq -c --argjson e "$entry" '. + [$e]' <<<"$kept")"
+      continue
+    fi
+
+    local target payload
+    target="$(restore_target "$entry")"
+    payload="$(jq -c -n --argjson t "$target" '{target:$t}')"
+
+    local expected actual
+    expected="$(jq -c '.expected // {}' <<<"$entry")"
+    if ! driver_call "$driver" get "$payload" "$lightId"; then
+      failed="$(jq -c --arg l "$label" --arg e "$DRIVER_ERR" '. + [{target:$l, error:$e}]' <<<"$failed")"
+      kept="$(jq -c --argjson e "$entry" --arg err "$DRIVER_ERR" '. + [($e | .error = $err)]' <<<"$kept")"
+      continue
+    fi
+    persist_rediscovery "$idx" "$DRIVER_OUT"
+    actual="$(jq -c '.state' <<<"$DRIVER_OUT")"
+
+    if ! state_matches "$expected" "$actual"; then
+      # The user took over this light: leave it alone and drop the entry.
+      skipped="$(jq -c --arg l "$label" '. + [{target:$l, reason:"manual-change"}]' <<<"$skipped")"
+      log info "restore skipped for $label: manual change detected"
+      continue
+    fi
+
+    local prior rpayload
+    prior="$(jq -c '.prior' <<<"$entry")"
+    rpayload="$(jq -c -n --argjson t "$target" --argjson p "$prior" '{target:$t, prior:$p}')"
+    if driver_call "$driver" restore "$rpayload" "$lightId"; then
+      persist_rediscovery "$idx" "$DRIVER_OUT"
+      ok="$(jq -c --arg l "$label" '. + [$l]' <<<"$ok")"
+      if [[ "$keep" == "1" ]]; then
+        kept="$(jq -c --argjson e "$entry" '. + [($e | .applied = false | .error = null)]' <<<"$kept")"
+      fi
+    else
+      failed="$(jq -c --arg l "$label" --arg e "$DRIVER_ERR" '. + [{target:$l, error:$e}]' <<<"$failed")"
+      kept="$(jq -c --argjson e "$entry" --arg err "$DRIVER_ERR" '. + [($e | .error = $err)]' <<<"$kept")"
+      log warn "restore failed for $label: $DRIVER_ERR"
+    fi
+  done
+
+  if [[ "$(jq -r 'length' <<<"$kept")" == "0" ]]; then
+    rm -f "$SNAPSHOT_FILE"
+  else
+    write_snapshot "$(jq -c --argjson k "$kept" '.entries = $k' <<<"$snap")"
+  fi
+
+  # A failed restore means the light is still red, so the reported state stays
+  # on_air and the reconciler keeps retrying.
+  CLEAR_OK="$ok"
+  CLEAR_FAILED="$failed"
+  CLEAR_SKIPPED="$skipped"
+  [[ "$(jq -r 'length' <<<"$failed")" == "0" ]] || CLEAR_STATE="on_air"
+}
+
+cmd_clear() {
+  MUTATING=1
+  local keep=0
+  while (( $# )); do
+    case "$1" in
+      --keep-snapshot) keep=1 ;;
+      *) die "unknown option for clear: $1" ;;
+    esac
+    shift
+  done
+  load_config
+  take_lock
+  clear_impl "$keep"
+  emit_result "$CLEAR_STATE" "$CLEAR_OK" "$CLEAR_FAILED" "$CLEAR_SKIPPED"
+}
+
+# -------------------------------------------------------------- pause/unpause
+
+cmd_pause() {
+  MUTATING=1
+  load_config
+  take_lock
+  atomic_write "$PAUSE_FILE" "$(jq -c -n --argjson t "$(now_epoch)" '{version:1, createdAt:$t}')"
+  clear_impl 1
+  log info "paused"
+  emit_result paused "$CLEAR_OK" "$CLEAR_FAILED" "$CLEAR_SKIPPED"
+}
+
+cmd_unpause() {
+  MUTATING=1
+  load_config
+  take_lock
+  rm -f "$PAUSE_FILE"
+  # Lights were restored while paused, so the stored priors are stale: drop the
+  # restored entries. A later trigger re-snapshots those lights fresh. Entries
+  # still applied, or whose restore failed (error recorded), stay behind — a
+  # light that may still be on-air is never abandoned.
+  local snap
+  snap="$(read_snapshot)"
+  if [[ "$snap" != "null" ]]; then
+    snap="$(jq -c '.entries |= map(select(.applied == true or .error != null))' <<<"$snap")"
+    if [[ "$(jq -r '.entries | length' <<<"$snap")" == "0" ]]; then
+      rm -f "$SNAPSHOT_FILE"
+    else
+      write_snapshot "$snap"
+    fi
+  fi
+  log info "unpaused"
+  emit_result off_air '[]' '[]'
+}
+
+# --------------------------------------------------------------------- test
+
+cmd_test() {
+  MUTATING=1
+  load_config
+  take_lock
+  if snapshot_exists; then
+    if [[ "$(jq -r '.test // false' "$SNAPSHOT_FILE")" != "true" ]]; then
+      die "refusing to test while a snapshot exists (run: on-air clear)"
+    fi
+    # A flash that was interrupted (crash, Ctrl-C) left its own snapshot and a
+    # red light. Undo it first, or this run would capture red as the new prior.
+    log warn "restoring an interrupted test flash before starting a new one"
+    clear_impl 0
+    if snapshot_exists; then
+      die "could not restore the previous test flash (run: on-air clear)"
+    fi
+  fi
+  local seconds="${ON_AIR_TEST_SECONDS:-3}"
+  local color brightness
+  color="$(cfg '.onAir.color')"
+  brightness="$(cfg '.onAir.brightnessPercent')"
+
+  # A test snapshot is written to disk too, so a crash mid-flash is recoverable
+  # with `on-air clear`.
+  local snap ok='[]' failed='[]'
+  snap="$(jq -c '.test = true' <<<"$(new_snapshot)")"
+  local driver idx targetId lightId
+  while IFS=$'\t' read -r driver idx targetId lightId; do
+    [[ -n "$driver" ]] || continue
+    validate_driver "$driver"
+    local label target payload
+    label="$(entry_label "$driver" "$lightId")"
+    target="$(target_config "$idx")"
+    payload="$(jq -c -n --argjson t "$target" '{target:$t}')"
+    if ! driver_call "$driver" get "$payload" "$lightId"; then
+      failed="$(jq -c --arg l "$label" --arg e "$DRIVER_ERR" '. + [{target:$l, error:$e}]' <<<"$failed")"
+      continue
+    fi
+    local prior pos
+    prior="$(jq -c '.state' <<<"$DRIVER_OUT")"
+    # The entry is written *before* the light is touched, exactly as `trigger`
+    # does it: a kill between the set and the write would otherwise leave a red
+    # light with no snapshot to restore it from.
+    snap="$(jq -c --arg d "$driver" --argjson i "$idx" --arg t "$targetId" --arg l "$lightId" \
+      --argjson prior "$prior" --argjson target "$target" '
+      .entries += [{driver:$d, targetIndex:$i, targetId:$t, lightId:$l,
+                    applied:false, prior:$prior, expected:null, target:$target, error:null}]' <<<"$snap")"
+    pos="$(jq -r '(.entries | length) - 1' <<<"$snap")"
+    write_snapshot "$snap"
+
+    payload="$(jq -c -n --argjson t "$target" --arg hex "$color" --argjson b "$brightness" \
+      '{target:$t, color:{hex:$hex, brightnessPercent:$b}}')"
+    if driver_call "$driver" set "$payload" "$lightId"; then
+      snap="$(jq -c --argjson p "$pos" --argjson exp "$(jq -c '.expected // {}' <<<"$DRIVER_OUT")" \
+        '.entries[$p].applied = true | .entries[$p].expected = $exp' <<<"$snap")"
+      ok="$(jq -c --arg l "$label" '. + [$l]' <<<"$ok")"
+    else
+      snap="$(jq -c --argjson p "$pos" --arg e "$DRIVER_ERR" '.entries[$p].error = $e' <<<"$snap")"
+      failed="$(jq -c --arg l "$label" --arg e "$DRIVER_ERR" '. + [{target:$l, error:$e}]' <<<"$failed")"
+    fi
+    write_snapshot "$snap"
+  done < <(target_entries)
+
+  sleep "$seconds"
+
+  clear_impl 0
+  # Report the flash result, but surface restore failures too.
+  failed="$(jq -c --argjson r "$CLEAR_FAILED" '. + $r' <<<"$failed")"
+  emit_result test "$ok" "$failed" "$CLEAR_SKIPPED"
+}
+
+# ------------------------------------------------------------------- status
+
+cmd_status() {
+  local as_json=0
+  [[ "${1:-}" != "--json" ]] || as_json=1
+  load_config
+
+  local snap paused targets health='[]'
+  snap="$(read_snapshot)"
+  paused=false
+  [[ ! -f "$PAUSE_FILE" ]] || paused=true
+  targets="$(cfgj '.targets // []')"
+
+  local n i
+  n="$(jq -r 'length' <<<"$targets")"
+  for (( i = 0; i < n; i++ )); do
+    local target driver reachable=false err=""
+    target="$(jq -c ".[$i]" <<<"$targets")"
+    driver="$(jq -r '.driver' <<<"$target")"
+    validate_driver "$driver"
+    if driver_call "$driver" health "$(jq -c -n --argjson t "$target" '{target:$t}')"; then
+      reachable=true
+    else
+      err="$DRIVER_ERR"
+    fi
+    health="$(jq -c --arg d "$driver" --argjson r "$reachable" --arg e "$err" \
+      --arg id "$(jq -r '(.bridgeId // .baseUrl // .name // "")' <<<"$target")" \
+      '. + [{driver:$d, id:$id, reachable:$r, error:$e}]' <<<"$health")"
+  done
+
+  local events
+  events="$(tail -n 10 "$LOG_FILE" 2>/dev/null || true)"
+
+  local state="off_air"
+  [[ "$snap" == "null" ]] || state="on_air"
+  [[ "$paused" != "true" ]] || state="paused"
+
+  if (( as_json )); then
+    # The snapshot carries its own copy of each target — credentials included,
+    # so a restore never depends on the config — hence it needs the same
+    # redaction as the config half before it leaves the process.
+    jq -c -n --arg state "$state" --argjson cfg "$(redact_config)" \
+      --argjson snapshot "$(redact_snapshot "$snap")" --argjson targets "$health" \
+      --arg events "$events" \
+      '{state:$state, config:$cfg, snapshot:$snapshot, targets:$targets,
+        events:($events | split("\n") | map(select(length > 0)))}'
+    return 0
+  fi
+
+  printf 'state:      %s\n' "$state"
+  printf 'config:     %s\n' "$CONFIG_FILE"
+  printf 'state dir:  %s\n' "$STATE_DIR"
+  printf '\nconfig (secrets redacted):\n'
+  redact_config | sed 's/^/  /'
+  printf '\ntargets:\n'
+  if [[ "$(jq -r 'length' <<<"$health")" == "0" ]]; then
+    printf '  (none configured)\n'
+  else
+    jq -r '.[] | "  \(.driver) \(.id) — \(if .reachable then "reachable" else "UNREACHABLE (\(.error))" end)"' <<<"$health"
+  fi
+  if [[ "$snap" != "null" ]]; then
+    printf '\nsnapshot:\n'
+    jq -r '.entries[] | "  \(.driver):\(.lightId) applied=\(.applied)\(if .error then " error=\(.error)" else "" end)"' <<<"$snap"
+  fi
+  printf '\nlast events:\n'
+  if [[ -n "$events" ]]; then printf '%s\n' "$events" | sed 's/^/  /'; else printf '  (none)\n'; fi
+}
+
+# ------------------------------------------------------------------- config
+
+cmd_config() {
+  case "${1:-}" in
+    --json | "")
+      load_config
+      cfgj '.'
+      ;;
+    set)
+      shift
+      MUTATING=1   # so even a usage error keeps the one-JSON-line contract
+      [[ $# -eq 2 ]] || die "usage: on-air config set <dotted.key> <json-value>|-"
+      # A literal "-" reads the value from stdin, so a value carrying a secret
+      # never has to appear in argv (SPEC: secrets are never in argv).
+      if [[ "$2" == "-" ]]; then
+        config_set "$1" "$(cat)" stdin
+      else
+        config_set "$1" "$2" argv
+      fi
+      ;;
+    *) die "usage: on-air config [--json] | on-air config set <dotted.key> <json-value>|-" ;;
+  esac
+}
+
+# Validate a dotted key/JSON value pair against the known schema, then write the
+# config atomically. This is the only writer the QML panel uses.
+#
+# No error message ever echoes the value: it may be a target object carrying an
+# application key, and die() writes to stdout, stderr and the on-disk log.
+config_set() { # key json-value [argv|stdin]
+  MUTATING=1
+  local key="$1" value="$2" source="${3:-argv}"
+  jq -e . >/dev/null 2>&1 <<<"$value" || die "value for $key is not valid JSON"
+  local type
+  type="$(jq -r 'type' <<<"$value")"
+
+  local check=""
+  case "$key" in
+    onAir.color)
+      [[ "$type" == "string" ]] || die "onAir.color must be a JSON string"
+      [[ "$(jq -r '.' <<<"$value")" =~ ^#[0-9a-fA-F]{6}$ ]] || die "onAir.color must be #rrggbb"
+      ;;
+    onAir.brightnessPercent)
+      check='. >= 1 and . <= 100' ;;
+    riseSeconds | clearSeconds)
+      check='. >= 0 and . <= 600' ;;
+    ignoreApps)
+      [[ "$type" == "array" ]] || die "$key must be a JSON array of strings"
+      jq -e 'all(type == "string")' >/dev/null <<<"$value" || die "$key must contain only strings"
+      ;;
+    appNames)
+      [[ "$type" == "object" ]] || die "$key must be a JSON object of binary→label"
+      jq -e 'all(.[]; type == "string")' >/dev/null <<<"$value" || die "$key values must be strings"
+      ;;
+    targets)
+      [[ "$type" == "array" ]] || die "$key must be a JSON array of target objects"
+      jq -e 'all(type == "object" and has("driver") and (.lights // [] | type == "array"))' \
+        >/dev/null <<<"$value" || die "each target needs a driver and a lights array"
+      jq -e 'all(.[]; all(.lights // [] | .[]; type == "string" and length > 0))' \
+        >/dev/null <<<"$value" || die "every light id must be a non-empty string"
+      # A target may carry an application key or a long-lived token; those must
+      # arrive on stdin, never on a command line other processes can read.
+      if [[ "$source" != "stdin" ]] &&
+         jq -e 'any(.[]; has("appKey") or has("token") or has("clientKey"))' >/dev/null <<<"$value"; then
+        die "a target carrying a secret must be piped in: on-air config set targets - (or run: on-air setup)"
+      fi
+      local d
+      while read -r d; do [[ -z "$d" ]] || validate_driver "$d"; done < <(jq -r '.[].driver' <<<"$value")
+      ;;
+    *) die "unknown config key: $key" ;;
+  esac
+  if [[ -n "$check" ]]; then
+    [[ "$type" == "number" ]] || die "$key must be a JSON number"
+    jq -e "$check" >/dev/null <<<"$value" || die "$key out of range"
+  fi
+
+  load_config
+  take_lock
+  local file_json path merged
+  file_json='{}'
+  [[ ! -f "$CONFIG_FILE" ]] || file_json="$(cat "$CONFIG_FILE")"
+  path="$(jq -c -n --arg k "$key" '$k | split(".")')"
+  merged="$(jq -c --argjson p "$path" --argjson v "$value" \
+    '(.version //= 1) | setpath($p; $v)' <<<"$file_json")"
+  save_config "$merged"
+  log info "config set $key"
+  CFG="$(jq -c -n --argjson d "$DEFAULT_CONFIG" --argjson f "$merged" '$d * $f')"
+  # Echo the accepted value with the same secret scrubbing status uses: a
+  # targets payload arriving on stdin carries the app key / token verbatim.
+  jq -c -n --arg k "$key" --argjson v "$value" "$JQ_SCRUB"'
+    {state:"ok", ok:[$k], failed:[], skipped:[],
+     value: (if $k == "targets" then ($v | map(scrub_target)) else $v end)}'
+}
+
+cmd_ignore() {
+  MUTATING=1
+  local action="${1:-}" bin="${2:-}"
+  [[ -n "$action" && -n "$bin" ]] || die "usage: on-air ignore add|remove <binary>"
+  [[ "$action" == "add" || "$action" == "remove" ]] || die "usage: on-air ignore add|remove <binary>"
+  # The whole read-modify-write happens under the lock config_set writes under,
+  # or a panel-driven `config set` landing between the read and the write would
+  # be silently overwritten. take_lock is idempotent, so config_set's own call
+  # is a no-op and the lock is held right through to the write.
+  take_lock
+  load_config
+  local list
+  list="$(cfgj '.ignoreApps')"
+  case "$action" in
+    add) list="$(jq -c --arg b "$bin" '. + [$b] | unique' <<<"$list")" ;;
+    remove) list="$(jq -c --arg b "$bin" 'map(select(. != $b))' <<<"$list")" ;;
+  esac
+  config_set ignoreApps "$list"
+}
+
+# The config file is only usable if it parses and declares a version we know;
+# purge has to cope with a broken one rather than refusing to uninstall.
+config_loadable() {
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  jq -e '.version == 1' >/dev/null 2>&1 <"$CONFIG_FILE"
+}
+
+cmd_purge() {
+  local yes=0 prompt
+  [[ "${1:-}" != "--yes" ]] || yes=1
+  prompt="Restore any on-air lights, then delete $CONFIG_FILE and $STATE_DIR?"
+  if (( ! yes )); then
+    local answer
+    if have gum && [[ -t 0 ]]; then
+      gum confirm "$prompt" || die "cancelled"
+    elif [[ -t 0 ]]; then
+      read -r -p "$prompt [y/N] " answer
+      [[ "$answer" =~ ^[Yy] ]] || die "cancelled"
+    else
+      die "purge needs --yes when not run interactively"
+    fi
+  fi
+
+  MUTATING=1
+  # Deleting the state directory while a meeting is on air would strand the
+  # bulbs red with the only record of their prior state gone, so the lights are
+  # restored first — under the same lock every other mutating command takes.
+  local restored='[]' failed='[]'
+  if config_loadable; then
+    load_config
+    take_lock
+    clear_impl 0
+    restored="$CLEAR_OK"
+    failed="$CLEAR_FAILED"
+    if [[ "$(jq -r 'length' <<<"$failed")" != "0" ]]; then
+      printf 'on-air: warning: %s light(s) could not be restored and may still be on-air.\n' \
+        "$(jq -r 'length' <<<"$failed")" >&2
+    fi
+  else
+    printf 'on-air: config is unreadable; deleting without restoring the lights.\n' >&2
+  fi
+
+  rm -rf -- "$STATE_DIR"
+  rm -f -- "$CONFIG_FILE"
+  # Same result contract as every other mutating command, so a light that could
+  # not be restored shows up as a partial (exit 2) rather than a silent success.
+  emit_result purged "$(jq -c '["config", "state"] + .' <<<"$restored")" "$failed"
+}
+
+# ------------------------------------------------------------------- detect
+
+# One-shot capture-holder set. Audio comes from pactl (PipeWire's pulse layer),
+# video from the V4L2 nodes — PipeWire cannot see direct V4L2 opens.
+#
+# A missing tool is reported in `warnings` rather than silently answering with
+# an empty array: "nothing is capturing" and "I cannot tell" look identical to
+# a caller otherwise, and the second one must never read as the first.
+DETECT_WARNINGS='[]'
+detect_warn() { DETECT_WARNINGS="$(jq -c --arg m "$1" '. + [$m]' <<<"$DETECT_WARNINGS")"; }
+
+cmd_detect() {
+  [[ "${1:---json}" == "--json" ]] || die "usage: on-air detect --json"
+  load_config
+  local names audio video
+  names="$(cfgj '.appNames')"
+  DETECT_WARNINGS='[]'
+
+  audio='[]'
+  if have pactl; then
+    local tsv
+    # LC_ALL=C: the parser matches pactl's English field names, which a
+    # localised pactl would translate out from under it.
+    tsv="$(LC_ALL=C pactl list source-outputs 2>/dev/null | detect_awk_audio || true)"
+    audio="$(printf '%s' "$tsv" | detect_tsv_to_json "$names")"
+  else
+    detect_warn "pactl not found — microphone detection disabled"
+  fi
+
+  # Every capture node that actually exists, not a guess at video0/video1: a
+  # second webcam, or a machine whose only camera is video2, was invisible.
+  local devices=() dev
+  for dev in /dev/video*; do
+    [[ -e "$dev" ]] || continue
+    devices+=("$dev")
+  done
+
+  video='[]'
+  if (( ${#devices[@]} > 0 )); then
+    local pids="" pid comm rows=""
+    if have fuser; then
+      pids="$(fuser "${devices[@]}" 2>/dev/null | tr -s ' ' '\n' | grep -o '[0-9]\+' | sort -un || true)"
+    else
+      detect_warn "fuser not found — camera detection fell back to scanning /proc"
+      pids="$(detect_video_pids_proc "${devices[@]}")"
+    fi
+    for pid in $pids; do
+      comm="$(cat "/proc/$pid/comm" 2>/dev/null || true)"
+      [[ -n "$comm" ]] || continue
+      rows+="$comm"$'\t'"$comm"$'\t'"$pid"$'\n'
+    done
+    video="$(printf '%s' "$rows" | detect_tsv_to_json "$names")"
+  fi
+
+  jq -c -n --argjson a "$audio" --argjson v "$video" --argjson w "$DETECT_WARNINGS" \
+    '{audio:$a, video:$v, warnings:$w}'
+}
+
+# fuser's job without fuser: walk /proc/<pid>/fd and keep the pids holding one
+# of the given device nodes. Only processes this user owns are visible, which
+# is exactly the set that matters — the meeting apps are all ours.
+detect_video_pids_proc() { # device...
+  local fd target pid
+  for fd in /proc/[0-9]*/fd/*; do
+    target="$(readlink "$fd" 2>/dev/null)" || continue
+    [[ -n "$target" ]] || continue
+    case " $* " in
+      *" $target "*) ;;
+      *) continue ;;
+    esac
+    pid="${fd#/proc/}"
+    printf '%s\n' "${pid%%/*}"
+  done | sort -un
+}
+
+# Emit "<binary>\t<app>\t<pid>" for every live, non-corked audio capture stream.
+# media.class must be exactly Stream/Input/Audio: the .../Internal variant is
+# WirePlumber's own loopback plumbing, not a real consumer.
+detect_awk_audio() {
+  awk '
+    function flush() {
+      if (started && cls == "Stream/Input/Audio" && corked != "yes") {
+        bin = props["application.process.binary"]
+        if (bin == "") bin = props["node.name"]
+        if (bin == "") bin = props["application.name"]
+        if (bin == "") bin = "unknown"
+        printf "%s\t%s\t%s\n", bin, props["application.name"], props["application.process.id"]
+      }
+      delete props; cls = ""; corked = ""; started = 0
+    }
+    {
+      line = $0
+      sub(/^[ \t]+/, "", line)
+      if (line ~ /^Source Output #/) { flush(); started = 1; next }
+      if (!started) next
+      if (line ~ /^Corked: /) { corked = substr(line, 9); next }
+      eq = index(line, " = ")
+      if (eq > 0) {
+        k = substr(line, 1, eq - 1)
+        v = substr(line, eq + 3)
+        gsub(/^"|"$/, "", v)
+        props[k] = v
+        if (k == "media.class") cls = v
+      }
+    }
+    END { flush() }
+  '
+}
+
+detect_tsv_to_json() { # appNames-json  (TSV on stdin)
+  jq -R -s --argjson names "$1" '
+    split("\n") | map(select(length > 0)) | map(split("\t")) | map({
+      binary: .[0],
+      app: ($names[.[0]] // (if (.[1] // "") == "" then .[0] else .[1] end)),
+      pid: (if (.[2] // "") == "" then null else (.[2] | tonumber) end)
+    })'
+}
+
+# -------------------------------------------------------------------- setup
+
+# The wizard prompts with gum when available and `read -p` otherwise, and is
+# fully drivable from the environment for tests (see --help).
+setup_noninteractive() {
+  [[ -n "${ON_AIR_SETUP_NONINTERACTIVE:-}" ]] || [[ ! -t 0 ]]
+}
+
+ask() { # prompt default
+  local prompt="$1" default="${2:-}" answer
+  if setup_noninteractive; then
+    printf '%s' "$default"
+    return 0
+  fi
+  if have gum; then
+    gum input --prompt "$prompt " --value "$default"
+  else
+    read -r -p "$prompt [$default]: " answer
+    printf '%s' "${answer:-$default}"
+  fi
+}
+
+# Same as ask, but never echoes what is typed (long-lived tokens).
+ask_secret() { # prompt
+  local prompt="$1" answer
+  if setup_noninteractive; then
+    return 0
+  fi
+  if have gum; then
+    gum input --password --prompt "$prompt "
+  else
+    read -r -s -p "$prompt " answer
+    printf '\n' >&2
+    printf '%s' "$answer"
+  fi
+}
+
+choose_one() { # prompt <options...>
+  local prompt="$1"
+  shift
+  if setup_noninteractive || [[ $# -eq 1 ]]; then
+    printf '%s' "$1"
+    return 0
+  fi
+  if have gum; then
+    printf '%s\n' "$@" | gum choose --header "$prompt"
+  else
+    local options=("$@")
+    local i=1 opt answer
+    for opt in "${options[@]}"; do printf '  %d) %s\n' "$i" "$opt" >&2; i=$((i + 1)); done
+    read -r -p "$prompt [1]: " answer
+    [[ "$answer" =~ ^[0-9]+$ ]] && (( answer >= 1 && answer <= ${#options[@]} )) || answer=1
+    printf '%s' "${options[$((answer - 1))]}"
+  fi
+}
+
+cmd_setup() {
+  load_config
+
+  local driver
+  driver="${ON_AIR_SETUP_DRIVER:-}"
+  if [[ -z "$driver" ]]; then
+    local available=()
+    local d
+    for d in "${DRIVER_ALLOWLIST[@]}"; do
+      [[ -x "$DRIVER_DIR/$d.sh" ]] && available+=("$d")
+    done
+    [[ ${#available[@]} -gt 0 ]] || die "no drivers installed in $DRIVER_DIR"
+    driver="$(choose_one "Which light system?" "${available[@]}")"
+  fi
+  validate_driver "$driver"
+
+  local target
+  target="$(jq -c -n --arg d "$driver" '{driver:$d}')"
+
+  if [[ "$driver" == "hue" ]]; then
+    local bridge="${ON_AIR_SETUP_BRIDGE:-}" bridgeId=""
+    if [[ -z "$bridge" ]]; then
+      printf 'Looking for a Hue bridge…\n' >&2
+      if driver_call hue discover '{}'; then
+        local candidates count
+        candidates="$(jq -c '.candidates // []' <<<"$DRIVER_OUT")"
+        count="$(jq -r 'length' <<<"$candidates")"
+        if (( count > 0 )); then
+          local ips=()
+          mapfile -t ips < <(jq -r '.[].ip' <<<"$candidates")
+          bridge="$(choose_one "Which bridge?" "${ips[@]}")"
+          bridgeId="$(jq -r --arg ip "$bridge" '.[] | select(.ip == $ip) | .bridgeId // ""' <<<"$candidates" | head -n1)"
+        fi
+      fi
+    fi
+    [[ -n "$bridge" ]] || bridge="$(ask "Bridge IP address:" "")"
+    [[ -n "$bridge" ]] || die "no bridge address given"
+    target="$(jq -c --arg b "$bridge" '.bridge = $b' <<<"$target")"
+    [[ -z "$bridgeId" ]] || target="$(jq -c --arg i "$bridgeId" '.bridgeId = $i' <<<"$target")"
+
+    local appKey="${ON_AIR_SETUP_APPKEY:-}"
+    if [[ -z "$appKey" && -n "$bridgeId" ]]; then
+      # Re-running setup against an already-paired bridge: reuse the stored
+      # key (verified with a health call) instead of demanding another
+      # link-button press.
+      local prior
+      prior="$(cfgj '(.targets // [])' | jq -c --arg b "$bridgeId" \
+        '[.[] | select(.driver == "hue" and .bridgeId == $b and (.appKey // "") != "")][0] // {}')"
+      if [[ "$(jq -r '.appKey // ""' <<<"$prior")" != "" ]]; then
+        local candidate
+        candidate="$(jq -c --argjson p "$prior" \
+          '.appKey = $p.appKey | if ($p.certPin // "") != "" then .certPin = $p.certPin else . end' <<<"$target")"
+        if driver_call hue health "$(jq -c -n --argjson t "$candidate" '{target:$t}')"; then
+          target="$candidate"
+          appKey="$(jq -r '.appKey' <<<"$prior")"
+          printf 'Reusing the existing bridge pairing.\n' >&2
+        fi
+      fi
+    fi
+    if [[ -z "$appKey" ]]; then
+      printf 'Press the round link button on the bridge…\n' >&2
+      driver_call hue pair "$(jq -c -n --argjson t "$target" '{target:$t}')" \
+        || die "pairing failed: $DRIVER_ERR"
+      appKey="$(jq -r '.appKey' <<<"$DRIVER_OUT")"
+      local pin bid
+      pin="$(jq -r '.certPin // ""' <<<"$DRIVER_OUT")"
+      bid="$(jq -r '.bridgeId // ""' <<<"$DRIVER_OUT")"
+      [[ -z "$pin" ]] || target="$(jq -c --arg p "$pin" '.certPin = $p' <<<"$target")"
+      [[ -z "$bid" ]] || target="$(jq -c --arg i "$bid" '.bridgeId = $i' <<<"$target")"
+    fi
+    target="$(jq -c --arg k "$appKey" '.appKey = $k' <<<"$target")"
+  fi
+
+  if [[ "$driver" == "home_assistant" ]]; then
+    local baseUrl token
+    baseUrl="${ON_AIR_SETUP_BASEURL:-$(ask "Home Assistant base URL:" "http://homeassistant.local:8123")}"
+    [[ -n "$baseUrl" ]] || die "no Home Assistant URL given"
+    token="${ON_AIR_SETUP_TOKEN:-}"
+    if [[ -z "$token" ]]; then
+      printf 'Create a long-lived access token in Home Assistant: profile → Security.\n' >&2
+      token="$(ask_secret "Long-lived access token:")"
+    fi
+    [[ -n "$token" ]] || die "no Home Assistant access token given"
+    target="$(jq -c --arg u "$baseUrl" --arg t "$token" '.baseUrl = $u | .token = $t' <<<"$target")"
+    # `pair` is the token check: it is the only proof the URL and token work.
+    driver_call home_assistant pair "$(jq -c -n --argjson t "$target" '{target:$t}')" \
+      || die "could not reach Home Assistant: $DRIVER_ERR"
+    local normalised
+    normalised="$(jq -r '.baseUrl // ""' <<<"$DRIVER_OUT")"
+    [[ -z "$normalised" ]] || target="$(jq -c --arg u "$normalised" '.baseUrl = $u' <<<"$target")"
+  fi
+
+  local lights=()
+  if [[ -n "${ON_AIR_SETUP_LIGHTS:-}" ]]; then
+    local envLights=() l
+    IFS=',' read -r -a envLights <<<"$ON_AIR_SETUP_LIGHTS"
+    for l in "${envLights[@]}"; do
+      [[ -n "$l" ]] && lights+=("$l")
+    done
+  else
+    driver_call "$driver" list_lights "$(jq -c -n --argjson t "$target" '{target:$t}')" \
+      || die "could not list lights: $DRIVER_ERR"
+    local list
+    list="$(jq -c '.lights // []' <<<"$DRIVER_OUT")"
+    [[ "$(jq -r 'length' <<<"$list")" != "0" ]] || die "no lights found"
+    local labels=() picked=()
+    mapfile -t labels < <(jq -r '.[] | "\(.id)\t\(.name // "light") [\(.capability // "color")]"' <<<"$list")
+    if have gum && ! setup_noninteractive; then
+      mapfile -t picked < <(printf '%s\n' "${labels[@]}" | gum choose --no-limit \
+        --header "Which lights should turn red? (space toggles, enter confirms)")
+    else
+      picked=("${labels[0]}")
+    fi
+    local row id
+    for row in "${picked[@]}"; do
+      id="${row%%$'\t'*}"
+      # gum emits a bare newline when enter is hit with nothing toggled; an
+      # empty id must never reach the config (drivers need a light id).
+      [[ -n "$id" ]] || continue
+      lights+=("$id")
+      case "$row" in
+        *"[onoff]"*)
+          printf 'warning: %s can only be switched on and off; it will be turned on, not reddened.\n' "$id" >&2 ;;
+        *"[dim]"*)
+          printf 'warning: %s cannot show red; only its brightness will change.\n' "$id" >&2 ;;
+        *"[ct]"*)
+          printf 'warning: %s cannot show red; it will use its warmest white instead.\n' "$id" >&2 ;;
+      esac
+    done
+  fi
+  [[ ${#lights[@]} -gt 0 ]] || die "no lights selected (in the picker, space toggles a light and enter confirms)"
+  target="$(printf '%s' "$target" | jq -c --args '.lights = $ARGS.positional' "${lights[@]}")"
+
+  local color brightness
+  color="${ON_AIR_SETUP_COLOR:-$(ask "On-air colour (#rrggbb):" "$(cfg '.onAir.color')")}"
+  brightness="${ON_AIR_SETUP_BRIGHTNESS:-$(ask "On-air brightness percent:" "$(cfg '.onAir.brightnessPercent')")}"
+  [[ "$color" =~ ^#[0-9a-fA-F]{6}$ ]] || die "colour must be #rrggbb"
+  [[ "$brightness" =~ ^[0-9]+$ ]] || die "brightness must be a whole percent"
+
+  # Everything above only prompted; from here the config is read, merged and
+  # written, so it happens under the same lock every other writer takes — a
+  # panel-driven `config set` racing the wizard must not be lost, and the
+  # config is re-read under the lock rather than trusting the copy loaded
+  # before the (arbitrarily long) interactive part.
+  take_lock
+  load_config
+  local merged
+  merged="$(jq -c --argjson t "$target" --arg c "$color" --argjson b "$brightness" '
+    .version = 1
+    | .onAir.color = $c
+    | .onAir.brightnessPercent = $b
+    | .targets = ((.targets // []) | map(select(.driver != $t.driver)) + [$t])' <<<"$CFG")"
+  save_config "$merged"
+  CFG="$merged"
+  log info "setup wrote config for driver $driver"
+  printf 'Wrote %s\n' "$CONFIG_FILE" >&2
+  # `on-air test` is a separate process taking the very same lock.
+  release_lock
+
+  if [[ -z "${ON_AIR_SETUP_SKIP_TEST:-}" ]] && ! setup_noninteractive; then
+    printf 'Flashing the lights…\n' >&2
+    "$SELF" test || true
+  fi
+  jq -c -n --arg d "$driver" --argjson n "${#lights[@]}" \
+    '{state:"configured", ok:[$d], failed:[], skipped:[], lights:$n}'
+}
+
+# --------------------------------------------------------------------- help
+
+usage() {
+  cat <<'EOF'
+on-air — smart-light control for the Omarchy "On Air" plugin
+
+Usage:
+  on-air setup                    Wizard: pick driver, discover, pair, choose lights, write config
+  on-air trigger                  Ensure on-air: snapshot (only if none exists), then apply the colour
+  on-air clear [--keep-snapshot]  Restore the lights from the snapshot
+  on-air pause                    Restore the lights but keep the snapshot (meeting-scoped pause)
+  on-air unpause                  Leave pause; the next trigger re-snapshots fresh
+  on-air test                     Flash for 3s then restore; refuses while a real snapshot exists
+  on-air status [--json]          Config (redacted), per-target reachability, last 10 log events
+  on-air config [--json]          Print the merged config for the QML layer
+  on-air config set <key> <json>  Set one validated config key, atomically
+                                  (use "-" as the value to read it from stdin)
+  on-air ignore add|remove <bin>  Edit ignoreApps without hand-editing JSON
+  on-air detect --json            One-shot capture-holder set:
+                                  {"audio":[…],"video":[…],"warnings":[…]}
+  on-air purge [--yes]            Restore the lights, then delete config + state
+  on-air version
+
+Every mutating command prints exactly one JSON line, e.g.
+  {"state":"on_air","ok":["hue:abc"],"failed":[{"target":"hue:def","error":"timeout"}],"skipped":[]}
+Exit codes: 0 all converged · 2 partial · 3 total failure · 1 config/usage error.
+
+Config keys accepted by `config set`:
+  onAir.color (#rrggbb) · onAir.brightnessPercent (1-100) · riseSeconds · clearSeconds
+  ignoreApps (array) · appNames (object) · targets (array)
+A target carrying an appKey or token must be piped in, never passed in argv:
+  jq -c … | on-air config set targets -
+
+Environment:
+  ON_AIR_CONFIG           Config file path (default ~/.config/on-air/config.json)
+  ON_AIR_STATE            State directory  (default ~/.local/state/on-air)
+  ON_AIR_DRIVERS          Driver directory (default <repo>/drivers)
+  ON_AIR_TEST_SECONDS     Flash duration for `test` (default 3)
+  ON_AIR_LOCK_WAIT        Seconds to wait for the state lock (default 15)
+  ON_AIR_LOG_MAX_BYTES    Log rotation threshold (default 65536)
+
+Non-interactive `setup` (used by the test suite; every value may be preset):
+  ON_AIR_SETUP_NONINTERACTIVE=1   Never prompt; take defaults/env values
+  ON_AIR_SETUP_DRIVER=hue|home_assistant|mock
+  ON_AIR_SETUP_BRIDGE=<ip>        Hue bridge address (skips discovery)
+  ON_AIR_SETUP_APPKEY=<key>       Hue application key (skips the link-button loop)
+  ON_AIR_SETUP_BASEURL=<url>      Home Assistant base URL
+  ON_AIR_SETUP_TOKEN=<token>      Home Assistant long-lived access token
+  ON_AIR_SETUP_LIGHTS=a,b,c       Light ids (skips the light picker)
+  ON_AIR_SETUP_COLOR=#rrggbb      On-air colour
+  ON_AIR_SETUP_BRIGHTNESS=100     On-air brightness percent
+  ON_AIR_SETUP_SKIP_TEST=1        Skip the closing test flash
+
+Driver testing:
+  ON_AIR_MOCK_FAIL=timeout|partial|http500   Failure injection in drivers/mock.sh
+  ON_AIR_MOCK_FAIL_LIGHTS=id1,id2            Which lights fail under `partial`
+EOF
+}
+
+# --------------------------------------------------------------------- main
+
+main() {
+  preflight
+  local cmd="${1:-help}"
+  [[ $# -eq 0 ]] || shift
+  case "$cmd" in
+    setup) cmd_setup "$@" ;;
+    trigger) cmd_trigger "$@" ;;
+    clear) cmd_clear "$@" ;;
+    pause) cmd_pause "$@" ;;
+    unpause | resume) cmd_unpause "$@" ;;
+    test) cmd_test "$@" ;;
+    status) cmd_status "$@" ;;
+    config) cmd_config "$@" ;;
+    ignore) cmd_ignore "$@" ;;
+    detect) cmd_detect "$@" ;;
+    purge) cmd_purge "$@" ;;
+    version | --version) printf '%s\n' "$VERSION" ;;
+    help | --help | -h) usage ;;
+    *)
+      printf 'on-air: unknown command: %s\n\n' "$cmd" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
