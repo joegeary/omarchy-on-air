@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "joegeary.on-air",
   "name": "On Air",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Joe Geary",
   "license": "MIT",
   "description": "Turns your smart lights red and shows a bar indicator when you are in a meeting.",
