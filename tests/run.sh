@@ -598,6 +598,35 @@ test_detect_shape() {
 # Only a stream someone is actually listening to counts. The meter case is the
 # one that shipped broken: opening the Omarchy audio panel drew a VU bar, which
 # opens a real capture stream, and the light went red with no meeting running.
+# Which app turned the light red is the one thing you want when a trigger looks
+# wrong, and only the detector knows it, so the CLI has to be told.
+test_trigger_records_the_apps() {
+  run_cli trigger --app Zoom
+  assert_eq "trigger --app exits 0" 0 "$RC"
+  assert_jq "the app lands in the result line" "$OUT" '.apps == ["Zoom"]'
+  assert_jq "the rest of the result is unchanged" "$OUT" \
+    '.state == "on_air" and (.ok | length) == 2'
+  check "the app lands in the log too" \
+    "$(grep -qF '"apps":["Zoom"]' "$ON_AIR_STATE/log" && echo 0 || echo 1)"
+
+  run_cli clear
+  assert_jq "clear names no apps" "$OUT" 'has("apps") | not'
+
+  run_cli trigger
+  assert_jq "a bare trigger omits the key entirely" "$OUT" 'has("apps") | not'
+
+  run_cli clear
+  run_cli trigger --app "Quickshell Peak Detect" --app Zoom
+  assert_jq "a name with spaces survives the round trip" "$OUT" \
+    '.apps == ["Quickshell Peak Detect", "Zoom"]'
+
+  run_cli trigger --bogus
+  assert_eq "an unknown option is rejected with exit 1" 1 "$RC"
+  assert_jq "and the refusal is still one JSON line" "$OUT" '.state == "error"'
+  run_cli trigger --app
+  assert_eq "a dangling --app is rejected with exit 1" 1 "$RC"
+}
+
 test_detect_ignores_meters_and_idle_streams() {
   local bindir="$SCRATCH/pactl-fixture/bin"
   rm -rf "$SCRATCH/pactl-fixture"
@@ -1241,6 +1270,7 @@ main() {
   run_test "clear --keep-snapshot"             test_keep_snapshot
   run_test "config set round-trip"             test_config_set_roundtrip
   run_test "detect --json shape"               test_detect_shape
+  run_test "trigger records the apps"          test_trigger_records_the_apps
   run_test "detect drops meters and idle"      test_detect_ignores_meters_and_idle_streams
   run_test "driver dispatch allowlist"         test_driver_dispatch_is_allowlisted
   run_test "test command"                      test_test_command

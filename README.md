@@ -141,7 +141,7 @@ testing).
 | Command | Description |
 |---|---|
 | `on-air setup` | Interactive wizard: pick driver, discover, pair, choose lights, test flash, write config |
-| `on-air trigger` | Ensure on-air: snapshot current state (only if no snapshot exists yet), apply the on-air color |
+| `on-air trigger [--app <name>]` | Ensure on-air: snapshot current state (only if no snapshot exists yet), apply the on-air color. `--app` may repeat; the names are recorded in the result line and the log, which is how the service says what put you on air |
 | `on-air clear [--keep-snapshot]` | Restore lights from the snapshot |
 | `on-air pause` | Restore the lights but keep the snapshot (meeting-scoped pause) |
 | `on-air unpause` | Leave pause; the next `trigger` re-snapshots fresh |
@@ -159,6 +159,9 @@ Every mutating command prints exactly one JSON result line on stdout, e.g.:
 ```json
 {"state":"on_air","ok":["hue:<uuid>"],"failed":[{"target":"hue:<uuid>","error":"timeout"}]}
 ```
+
+A `trigger` that was given `--app` carries the names as an extra `apps` key; no other
+command emits one.
 
 Exit codes: `0` everything converged, `2` partial failure, `3` total failure, `1`
 config/usage error.
@@ -277,7 +280,9 @@ bridge → ... → Apps).
 ## Troubleshooting
 
 - `on-air status` - shows redacted config, per-target reachability, and the last 10
-  log events (state transitions + driver results) from `~/.local/state/on-air/log`.
+  log events (state transitions, driver results, and the apps that triggered them)
+  from `~/.local/state/on-air/log`. When the light went red and you want to know why,
+  the `apps` list on the last `on_air` result names what was holding a capture.
 - QML/service errors: the shell writes its own log - find it with
   `ls /run/user/$UID/quickshell/by-pid/$(pgrep -x quickshell)/` and read it with
   `qs log <that dir>/log.qslog`. (On installs that run the shell as a systemd unit,
