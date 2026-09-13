@@ -1013,11 +1013,14 @@ detect_video_pids_proc() { # device...
 
 # Emit "<binary>\t<app>\t<pid>" for every live, non-corked audio capture stream.
 # media.class must be exactly Stream/Input/Audio: the .../Internal variant is
-# WirePlumber's own loopback plumbing, not a real consumer.
+# WirePlumber's own loopback plumbing, not a real consumer. A level meter opens
+# a genuine capture stream just to draw a VU bar; media.category = Monitor is
+# how every mixer marks one.
 detect_awk_audio() {
   awk '
     function flush() {
-      if (started && cls == "Stream/Input/Audio" && corked != "yes") {
+      if (started && cls == "Stream/Input/Audio" && corked != "yes" &&
+          props["media.category"] != "Monitor") {
         bin = props["application.process.binary"]
         if (bin == "") bin = props["node.name"]
         if (bin == "") bin = props["application.name"]

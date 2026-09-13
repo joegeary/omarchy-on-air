@@ -319,6 +319,9 @@ QtObject {
       if (mediaClass.indexOf("Stream/Input/Audio") !== 0) continue
       if (mediaClass.indexOf("/Internal") >= 0) continue
       if (record.corked) continue
+      // A level meter opens a genuine capture stream just to draw a VU bar;
+      // media.category = Monitor is how every mixer marks one.
+      if (record.props["media.category"] === "Monitor") continue
       var binary = record.props["application.process.binary"]
         || record.props["application.name"]
         || record.props["node.name"]

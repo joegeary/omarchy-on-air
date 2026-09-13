@@ -12,7 +12,9 @@ Detection watches your microphone and camera: Zoom, Teams, Google
 Meet, Slack huddles, Discord, and anything else that opens an input stream all trigger
 it, labeled where recognized and shown by binary name otherwise. Recording tools (OBS
 and friends) are ignored by default so they never trip the light on their own but a
-meeting running alongside one still counts.
+meeting running alongside one still counts. A level meter is not a meeting: a VU bar
+(the Omarchy audio panel, pavucontrol) opens a genuine capture stream but marks it
+`media.category = Monitor`, and those never count.
 
 Plugin id: `joegeary.on-air`
 
