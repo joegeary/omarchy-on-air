@@ -319,6 +319,9 @@ QtObject {
       if (mediaClass.indexOf("Stream/Input/Audio") !== 0) continue
       if (mediaClass.indexOf("/Internal") >= 0) continue
       if (record.corked) continue
+      // A level meter opens a genuine capture stream just to draw a VU bar;
+      // media.category = Monitor is how every mixer marks one.
+      if (record.props["media.category"] === "Monitor") continue
       var binary = record.props["application.process.binary"]
         || record.props["application.name"]
         || record.props["node.name"]
@@ -657,7 +660,16 @@ QtObject {
     // deadline — not retryTimer alone — is what holds the retry back; only a
     // genuinely new target jumps the queue.
     if (root.desiredState === root._requestedState && Date.now() < root._nextRetryAtMs) return
-    root.runCli(root.desiredState === "on_air" ? ["trigger"] : ["clear"])
+    if (root.desiredState !== "on_air") {
+      root.runCli(["clear"])
+      return
+    }
+    // Name the apps holding a capture: only the detector knows them, and by the
+    // time a false trigger is being read out of the log nothing else can say
+    // what turned the light red.
+    var args = ["trigger"]
+    for (var i = 0; i < root._activeApps.length; i++) args.push("--app", String(root._activeApps[i]))
+    root.runCli(args)
   }
 
   function runCli(args) {

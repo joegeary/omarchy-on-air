@@ -85,12 +85,16 @@ log() {
 emit_result() {
   local state="$1" ok_json="$2" failed_json="$3" skipped_json="${4:-[]}"
   local line code ok_n failed_n
+  # `apps` is additive and only appears when there is something to say, so
+  # clear, pause and a hand-run `trigger` keep their existing output.
   line=$(jq -c -n \
     --arg state "$state" \
     --argjson ok "$ok_json" \
     --argjson failed "$failed_json" \
     --argjson skipped "$skipped_json" \
-    '{state:$state, ok:$ok, failed:$failed, skipped:$skipped}')
+    --argjson apps "$TRIGGER_APPS" \
+    '{state:$state, ok:$ok, failed:$failed, skipped:$skipped}
+     + (if ($apps | length) > 0 then {apps:$apps} else {} end)')
   ok_n=$(jq -r 'length' <<<"$ok_json")
   failed_n=$(jq -r 'length' <<<"$failed_json")
   printf '%s\n' "$line"
@@ -383,8 +387,29 @@ state_matches() { # expected-json actual-json
 
 # ------------------------------------------------------------------ trigger
 
+# The detector is the only thing that knows which apps hold a capture, so
+# `trigger` is told rather than re-detecting: by the time the CLI runs the app
+# set may already have moved on. Carried to emit_result as a global, the way the
+# CLEAR_* results below are.
+TRIGGER_APPS='[]'
+
 cmd_trigger() {
   MUTATING=1
+  local apps=()
+  while (( $# )); do
+    case "$1" in
+      # Repeated rather than delimited: app names contain spaces.
+      --app)
+        shift
+        (( $# )) || die "trigger --app needs an app name"
+        apps+=("$1")
+        ;;
+      *) die "unknown option for trigger: $1" ;;
+    esac
+    shift
+  done
+  (( ${#apps[@]} == 0 )) || TRIGGER_APPS="$(jq -c -n '$ARGS.positional' --args "${apps[@]}")"
+
   load_config
   take_lock
 
@@ -1013,11 +1038,14 @@ detect_video_pids_proc() { # device...
 
 # Emit "<binary>\t<app>\t<pid>" for every live, non-corked audio capture stream.
 # media.class must be exactly Stream/Input/Audio: the .../Internal variant is
-# WirePlumber's own loopback plumbing, not a real consumer.
+# WirePlumber's own loopback plumbing, not a real consumer. A level meter opens
+# a genuine capture stream just to draw a VU bar; media.category = Monitor is
+# how every mixer marks one.
 detect_awk_audio() {
   awk '
     function flush() {
-      if (started && cls == "Stream/Input/Audio" && corked != "yes") {
+      if (started && cls == "Stream/Input/Audio" && corked != "yes" &&
+          props["media.category"] != "Monitor") {
         bin = props["application.process.binary"]
         if (bin == "") bin = props["node.name"]
         if (bin == "") bin = props["application.name"]
@@ -1285,7 +1313,8 @@ on-air — smart-light control for the Omarchy "On Air" plugin
 
 Usage:
   on-air setup                    Wizard: pick driver, discover, pair, choose lights, write config
-  on-air trigger                  Ensure on-air: snapshot (only if none exists), then apply the colour
+  on-air trigger [--app <name>]   Ensure on-air: snapshot (only if none exists), then apply the colour
+                                  --app may repeat; the names are recorded in the result line and the log
   on-air clear [--keep-snapshot]  Restore the lights from the snapshot
   on-air pause                    Restore the lights but keep the snapshot (meeting-scoped pause)
   on-air unpause                  Leave pause; the next trigger re-snapshots fresh
